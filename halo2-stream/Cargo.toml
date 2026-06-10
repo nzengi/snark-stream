@@ -1,0 +1,14 @@
+[package]
+name = "halo2-stream"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Out-of-core SRS and quotient for a deployed halo2 KZG prover: stream the bases and the extended-domain cosets from disk."
+repository = "https://github.com/nzengi/snark-stream"
+publish = false
+
+[dependencies]
+# Pinned to halo2_backend's version so bn256 G1Affine/Fr are the *same* types the
+# patched halo2 uses (else trait impls won't line up across the boundary).
+halo2curves = { version = "0.7.0", default-features = false }
+rayon = "1"

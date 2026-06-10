@@ -1,0 +1,42 @@
+[package]
+name = "halo2_middleware"
+version = "0.4.0"
+authors = [
+    "Sean Bowe <sean@electriccoin.co>",
+    "Ying Tong Lai <yingtong@electriccoin.co>",
+    "Daira Hopwood <daira@electriccoin.co>",
+    "Jack Grigg <jack@electriccoin.co>",
+    "Privacy Scaling Explorations team",
+]
+edition = "2021"
+rust-version = "1.66.0"
+description = """
+Halo2 middleware.  This package contains the types and traits required for the frontend-backend interaction.
+"""
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/privacy-scaling-explorations/halo2"
+documentation = "https://privacy-scaling-explorations.github.io/halo2/"
+readme = "README.md"
+categories = ["cryptography"]
+keywords = ["halo", "proofs", "zkp", "zkSNARKs"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--html-in-header", "katex-header.html"]
+
+[dependencies]
+ff = "0.13"
+halo2curves = { version = "0.7.0", default-features = false }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_derive = { version = "1", optional = true}
+rayon = "1.8"
+
+[dev-dependencies]
+ark-std = { version = "0.3" }
+proptest = "1"
+group = "0.13"
+rand_xorshift = "0.3.0"
+rand_core = "0.6.4"
+
+[lib]
+bench = false

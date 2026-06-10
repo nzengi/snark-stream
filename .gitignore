@@ -1,0 +1,16 @@
+# build output (both the root workspace and the vendored halo2-fork workspace)
+target/
+
+# working context / internal notes — keep out of any future public history
+CLAUDE.md
+
+# editor / OS noise
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# scratch and recordings
+*.cast
+*.profraw

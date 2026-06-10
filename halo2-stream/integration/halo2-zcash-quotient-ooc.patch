@@ -1,0 +1,250 @@
+diff --git a/halo2_proofs/src/plonk/vanishing/prover.rs b/halo2_proofs/src/plonk/vanishing/prover.rs
+index 15b90f1..9533f17 100644
+--- a/halo2_proofs/src/plonk/vanishing/prover.rs
++++ b/halo2_proofs/src/plonk/vanishing/prover.rs
+@@ -78,8 +78,25 @@ impl<C: CurveAffine> Committed<C> {
+         transcript: &mut T,
+     ) -> Result<Constructed<C>, Error> {
+         // Evaluate the h(X) polynomial's constraint system expressions for the constraints provided
+-        let h_poly = poly::Ast::distribute_powers(expressions, *y); // Fold the gates together with the y challenge
+-        let h_poly = evaluator.evaluate(&h_poly, domain); // Evaluate the h(X) polynomial
++        let h_ast = poly::Ast::distribute_powers(expressions, *y); // Fold the gates together with the y challenge
++        let h_poly = evaluator.evaluate(&h_ast, domain); // Evaluate the h(X) polynomial
++
++        // snark-stream: recompute the quotient out-of-core (each registered coset
++        // spilled to disk, read a chunk window at a time through the same Ast
++        // evaluator) and assert it is byte-identical to the in-core one.
++        if std::env::var("SS_CHECK_OOC").is_ok() {
++            let dir = std::env::var("SS_OOC_DIR").unwrap_or_else(|_| "/var/tmp".to_string());
++            let h_ooc = evaluator.evaluate_ooc(&h_ast, domain, std::path::Path::new(&dir));
++            assert_eq!(
++                h_poly[..],
++                h_ooc[..],
++                "SS_CHECK_OOC: evaluate_ooc != evaluate"
++            );
++            eprintln!(
++                "SS_CHECK_OOC: out-of-core quotient == in-core, {} extended values",
++                h_poly.len()
++            );
++        }
+ 
+         // Divide by t(X) = X^{params.n} - 1.
+         let h_poly = domain.divide_by_vanishing_poly(h_poly);
+diff --git a/halo2_proofs/src/poly/domain.rs b/halo2_proofs/src/poly/domain.rs
+index bf03c1c..7aa97d0 100644
+--- a/halo2_proofs/src/poly/domain.rs
++++ b/halo2_proofs/src/poly/domain.rs
+@@ -294,6 +294,57 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
+         poly.get_chunk_of_rotated_helper(rotation.0 < 0, new_rotation, chunk_size, chunk_index)
+     }
+ 
++    /// Disk-backed twin of [`Self::get_chunk_of_rotated_extended`]: reads the same
++    /// chunk of the rotated polynomial straight from a scratch file holding the
++    /// extended coset as `PrimeField::to_repr` records (`width` bytes each), so the
++    /// coset need not be resident. The rotation is a cyclic shift, so the chunk is a
++    /// contiguous window starting at `(chunk_start + mid) mod extended_len`, wrapped.
++    /// Used by the out-of-core quotient evaluator.
++    pub(crate) fn get_chunk_of_rotated_extended_from_file(
++        &self,
++        file: &std::fs::File,
++        width: usize,
++        rotation: Rotation,
++        chunk_size: usize,
++        chunk_index: usize,
++    ) -> Vec<F> {
++        use std::os::unix::fs::FileExt;
++        let ext_len = self.extended_len();
++        let new_rotation =
++            (1usize << (self.extended_k - self.k)) * rotation.0.unsigned_abs() as usize;
++        // First element of the rotated poly is `original[mid]`.
++        let mid = if rotation.0 >= 0 {
++            new_rotation
++        } else {
++            ext_len - new_rotation
++        };
++        let chunk_start = chunk_size * chunk_index;
++        let chunk_end = ext_len.min(chunk_size * (chunk_index + 1));
++        let chunk_len = chunk_end - chunk_start;
++
++        let mut out = Vec::with_capacity(chunk_len);
++        let mut cur = (chunk_start + mid) % ext_len;
++        let mut remaining = chunk_len;
++        let mut buf = Vec::new();
++        while remaining > 0 {
++            let run = remaining.min(ext_len - cur);
++            buf.resize(run * width, 0u8);
++            file.read_exact_at(&mut buf, (cur * width) as u64)
++                .expect("read coset window");
++            for c in buf.chunks_exact(width) {
++                let mut repr = F::Repr::default();
++                repr.as_mut().copy_from_slice(c);
++                out.push(Option::<F>::from(F::from_repr(repr)).expect("canonical repr"));
++            }
++            remaining -= run;
++            cur += run;
++            if cur == ext_len {
++                cur = 0;
++            }
++        }
++        out
++    }
++
+     /// This takes us from the extended evaluation domain and gets us the
+     /// quotient polynomial coefficients.
+     ///
+diff --git a/halo2_proofs/src/poly/evaluator.rs b/halo2_proofs/src/poly/evaluator.rs
+index 16f0225..b881757 100644
+--- a/halo2_proofs/src/poly/evaluator.rs
++++ b/halo2_proofs/src/poly/evaluator.rs
+@@ -228,6 +228,151 @@ impl<E, F: Field, B: Basis> Evaluator<E, F, B> {
+     }
+ }
+ 
++impl<E, F: WithSmallOrderMulGroup<3>> Evaluator<E, F, ExtendedLagrangeCoeff> {
++    /// Out-of-core twin of [`Evaluator::evaluate`] for the quotient (extended basis).
++    /// Spills each registered coset to a scratch file and reads only the chunk window
++    /// each `Ast::Poly` leaf needs — the same range [`Evaluator::evaluate`] would take,
++    /// with the rotation handled as a cyclic window — so the cosets need not all be
++    /// resident at once. Byte-for-byte identical to `evaluate`; scratch lives in `dir`.
++    pub(crate) fn evaluate_ooc(
++        &self,
++        ast: &Ast<E, F, ExtendedLagrangeCoeff>,
++        domain: &EvaluationDomain<F>,
++        dir: &std::path::Path,
++    ) -> Polynomial<F, ExtendedLagrangeCoeff>
++    where
++        E: Copy + Send + Sync,
++    {
++        use std::os::unix::fs::FileExt;
++
++        let poly_len = self.polys.first().unwrap().len();
++        let (chunk_size, _num_chunks) = get_chunk_params(poly_len);
++        let width = F::Repr::default().as_ref().len();
++
++        // Spill every registered coset to its own scratch file (to_repr records).
++        let files: Vec<std::fs::File> = self
++            .polys
++            .iter()
++            .enumerate()
++            .map(|(i, poly)| {
++                let path = dir.join(format!("zk_ooc_{i}.bin"));
++                let f = std::fs::OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .create(true)
++                    .truncate(true)
++                    .open(&path)
++                    .expect("create scratch");
++                let mut buf = vec![0u8; poly.len() * width];
++                for (v, c) in poly.values.iter().zip(buf.chunks_exact_mut(width)) {
++                    c.copy_from_slice(v.to_repr().as_ref());
++                }
++                f.write_all_at(&buf, 0).expect("spill coset");
++                f
++            })
++            .collect();
++
++        struct AstContext<'a, F: Field> {
++            domain: &'a EvaluationDomain<F>,
++            poly_len: usize,
++            chunk_size: usize,
++            chunk_index: usize,
++            files: &'a [std::fs::File],
++            width: usize,
++        }
++
++        fn recurse<E, F: WithSmallOrderMulGroup<3>>(
++            ast: &Ast<E, F, ExtendedLagrangeCoeff>,
++            ctx: &AstContext<'_, F>,
++        ) -> Vec<F> {
++            match ast {
++                Ast::Poly(leaf) => ctx.domain.get_chunk_of_rotated_extended_from_file(
++                    &ctx.files[leaf.index],
++                    ctx.width,
++                    leaf.rotation,
++                    ctx.chunk_size,
++                    ctx.chunk_index,
++                ),
++                Ast::Add(a, b) => {
++                    let mut lhs = recurse(a, ctx);
++                    let rhs = recurse(b, ctx);
++                    for (lhs, rhs) in lhs.iter_mut().zip(rhs.iter()) {
++                        *lhs += *rhs;
++                    }
++                    lhs
++                }
++                Ast::Mul(AstMul(a, b)) => {
++                    let mut lhs = recurse(a, ctx);
++                    let rhs = recurse(b, ctx);
++                    for (lhs, rhs) in lhs.iter_mut().zip(rhs.iter()) {
++                        *lhs *= *rhs;
++                    }
++                    lhs
++                }
++                Ast::Scale(a, scalar) => {
++                    let mut lhs = recurse(a, ctx);
++                    for lhs in lhs.iter_mut() {
++                        *lhs *= scalar;
++                    }
++                    lhs
++                }
++                Ast::DistributePowers(terms, base) => terms.iter().fold(
++                    <ExtendedLagrangeCoeff as BasisOps>::constant_term(
++                        ctx.poly_len,
++                        ctx.chunk_size,
++                        ctx.chunk_index,
++                        F::ZERO,
++                    ),
++                    |mut acc, term| {
++                        let term = recurse(term, ctx);
++                        for (acc, term) in acc.iter_mut().zip(term) {
++                            *acc *= base;
++                            *acc += term;
++                        }
++                        acc
++                    },
++                ),
++                Ast::LinearTerm(scalar) => <ExtendedLagrangeCoeff as BasisOps>::linear_term(
++                    ctx.domain,
++                    ctx.poly_len,
++                    ctx.chunk_size,
++                    ctx.chunk_index,
++                    *scalar,
++                ),
++                Ast::ConstantTerm(scalar) => <ExtendedLagrangeCoeff as BasisOps>::constant_term(
++                    ctx.poly_len,
++                    ctx.chunk_size,
++                    ctx.chunk_index,
++                    *scalar,
++                ),
++            }
++        }
++
++        let mut result = <ExtendedLagrangeCoeff as BasisOps>::empty_poly(domain);
++        multicore::scope(|scope| {
++            for (chunk_index, out) in result.chunks_mut(chunk_size).enumerate() {
++                let files = &files;
++                scope.spawn(move |_| {
++                    let ctx = AstContext {
++                        domain,
++                        poly_len,
++                        chunk_size,
++                        chunk_index,
++                        files,
++                        width,
++                    };
++                    out.copy_from_slice(&recurse(ast, &ctx));
++                });
++            }
++        });
++
++        for i in 0..self.polys.len() {
++            let _ = std::fs::remove_file(dir.join(format!("zk_ooc_{i}.bin")));
++        }
++        result
++    }
++}
++
+ /// Struct representing the [`Ast::Mul`] case.
+ ///
+ /// This struct exists to make the internals of this case private so that we don't

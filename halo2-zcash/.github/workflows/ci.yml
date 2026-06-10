@@ -1,0 +1,210 @@
+name: CI checks
+
+on:
+  pull_request:
+  push:
+    branches: main
+
+permissions:
+  contents: read # required to check out the private repository
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}${{ matrix.name_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [stable, beta, nightly]
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        include:
+          - stage: beta
+            name_suffix: " with beta features"
+            extra_flags: --features beta
+          - stage: nightly
+            name_suffix: " with nightly features"
+            extra_flags: --features nightly
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: ./.github/actions/prepare
+      - name: Run tests
+        env:
+          FEATURE_FLAGS: ${{ steps.prepare.outputs.feature-flags }}
+        run: >
+          cargo test
+          --verbose
+          --release
+          --workspace
+          $FEATURE_FLAGS
+          ${{ matrix.extra_flags }}
+      - name: Verify working directory is clean
+        run: git diff --exit-code
+
+  test-32-bit:
+    name: Test on i686-unknown-linux-gnu${{ matrix.name_suffix }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stage: [stable, beta, nightly]
+        include:
+          - stage: beta
+            name_suffix: " with beta features"
+          - stage: nightly
+            name_suffix: " with nightly features"
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: ./.github/actions/prepare
+        with:
+          beta-features: ${{ matrix.stage == 'beta' }}
+          nightly-features: ${{ matrix.stage == 'nightly' }}
+      - name: Install cross-platform support dependencies
+        run: sudo apt install gcc-multilib
+      - run: rustup target add i686-unknown-linux-gnu
+      - name: Run tests
+        env:
+          FEATURE_FLAGS: ${{ steps.prepare.outputs.feature-flags }}
+        run: >
+          cargo test
+          --verbose
+          --release
+          --workspace
+          --target i686-unknown-linux-gnu
+          $FEATURE_FLAGS
+
+  build:
+    name: Build target ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - wasm32-unknown-unknown
+          - wasm32-wasi
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: ./.github/actions/prepare
+        with:
+          nightly-features: true
+          test-dependencies: false
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: cargo build
+        env:
+          FEATURE_FLAGS: ${{ steps.prepare.outputs.feature-flags }}
+        run: >
+          cargo build
+          $FEATURE_FLAGS
+          --target ${{ matrix.target }}
+
+  bitrot:
+    name: Bitrot check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare
+      # Check bitrot with stable (as we don't need benchmarks or the test-dev-graph
+      # feature flag to work with MSRV).
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master HEAD 2026-05-31
+        id: toolchain
+        with:
+          toolchain: stable
+      - run: rustup override set "${TOOLCHAIN}"
+        shell: sh
+        env:
+          TOOLCHAIN: ${{steps.toolchain.outputs.name}}
+      - run: sudo apt-get -y install libfontconfig1-dev
+      # Build benchmarks and all-features to prevent bitrot
+      - name: Build benchmarks
+        run: cargo build --benches --examples --all-features
+
+  book:
+    name: Book tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare
+      # Build with stable so the .rmeta files match what mdBook expects.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master HEAD 2026-05-31
+        id: toolchain
+        with:
+          toolchain: stable
+      - run: rustup override set "${TOOLCHAIN}"
+        shell: sh
+        env:
+          TOOLCHAIN: ${{steps.toolchain.outputs.name}}
+      - name: cargo build
+        run: cargo build
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@ee69d230fe19748b7abf22df32acaa93833fad08 # v2.0.0
+        with:
+          mdbook-version: '0.5.1'
+      - name: Test halo2 book
+        run: mdbook test -L target/debug/deps book/
+
+  codecov:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    container:
+      image: xd009642/tarpaulin:develop-nightly
+      options: --security-opt seccomp=unconfined
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: ./.github/actions/prepare
+        with:
+          nightly-features: true
+      # Extend the timeout to 3600 to ensure the code coverage test pass
+      - name: Generate coverage report
+        env:
+          FEATURE_FLAGS: ${{ steps.prepare.outputs.feature-flags }}
+        run: >
+          cargo tarpaulin
+          --engine llvm
+          $FEATURE_FLAGS
+          --timeout 3600
+          --out xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+
+  doc-links:
+    name: Intra-doc links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare
+      - run: sudo apt-get -y install libfontconfig1-dev
+      - run: cargo fetch
+      # Ensure intra-documentation links all resolve correctly
+      # Requires #![deny(intra_doc_link_resolution_failure)] in crates.
+      - name: Check intra-doc links
+        run: cargo doc --all --all-features --document-private-items
+
+  fmt:
+    name: Rustfmt
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare
+      - run: cargo fmt --all -- --check

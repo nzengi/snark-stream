@@ -1,0 +1,51 @@
+name: 'Prepare Halo 2'
+description: 'Prepares feature flags'
+inputs:
+  beta-features:
+    description: 'Include beta features'
+    required: false
+    default: false
+  nightly-features:
+    description: 'Include nightly features'
+    required: false
+    default: false
+  test-dependencies:
+    description: 'Include test dependencies'
+    required: false
+    default: true
+outputs:
+  feature-flags:
+    description: 'Feature flags'
+    value: ${{ steps.prepare-flags.outputs.flags }}
+runs:
+  using: 'composite'
+  steps:
+    - id: beta
+      shell: bash
+      run: echo "feature=--features beta" >> "$GITHUB_OUTPUT"
+      if: inputs.beta-features == 'true'
+    - id: nightly
+      shell: bash
+      run: echo "feature=--features nightly" >> "$GITHUB_OUTPUT"
+      if: inputs.nightly-features == 'true'
+    - id: test
+      shell: bash
+      run: echo "feature=--features test-dependencies" >> "$GITHUB_OUTPUT"
+      if: inputs.test-dependencies == 'true'
+      # Emits one `--features <name>` token per enabled feature (cargo unions
+      # repeated --features flags). The result is whitespace-separated so callers
+      # can splat it unquoted without re-introducing shell-quoting.
+    - id: prepare-flags
+      shell: bash
+      env:
+        BETA: ${{ steps.beta.outputs.feature }}
+        NIGHTLY: ${{ steps.nightly.outputs.feature }}
+        TEST: ${{ steps.test.outputs.feature }}
+      run: >
+        echo "flags=--no-default-features
+        --features batch
+        --features dev-graph
+        --features gadget-traces
+        ${BETA}
+        ${NIGHTLY}
+        ${TEST}" >> "$GITHUB_OUTPUT"

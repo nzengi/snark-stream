@@ -1,0 +1,32 @@
+name: Stable lints
+
+# We only run these lints on trial-merges of PRs to reduce noise.
+on: pull_request
+
+jobs:
+  clippy:
+    name: Clippy (MSRV)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the (private) repository
+      checks: write # post Clippy annotations as a check run
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - id: prepare
+        uses: ./.github/actions/prepare
+        with:
+          nightly-features: true
+      - name: Run clippy
+        uses: auguwu/clippy-action@9817d076b82df0194935be9db6154c56ac07b317 # 1.5.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # cargo-level flags go in `check-args` (before the `--`); lint levels
+          # go in `deny`/`warn` (the action places them after the `--`).
+          check-args: >
+            ${{ steps.prepare.outputs.feature-flags }}
+            --all-targets
+          deny: warnings

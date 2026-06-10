@@ -1,0 +1,15 @@
+[package]
+name = "ooc-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Measurement harness for the out-of-core halo2 KZG/SHPLONK prover: SRS in RAM vs streamed, and the tiled quotient."
+
+[dependencies]
+halo2_proofs = { path = "../halo2_proofs", default-features = false }
+halo2_backend = { path = "../halo2_backend", default-features = false }
+halo2_debug = { path = "../halo2_debug" }
+halo2curves = { version = "0.7.0", default-features = false }
+group = "0.13"
+# Reads the on-disk SRS back into RAM for the stock (A) side of the comparison.
+halo2-stream = { path = "../../snark-stream/halo2-stream" }

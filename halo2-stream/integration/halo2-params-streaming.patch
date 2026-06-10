@@ -1,0 +1,1319 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1e75bcb..faf338f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,5 +7,6 @@ members = [
+     "halo2_backend",
+     "halo2_debug",
+     "p3_frontend",
++    "ooc-demo",
+ ]
+ resolver = "2"
+diff --git a/halo2_backend/Cargo.toml b/halo2_backend/Cargo.toml
+index e46a42e..99b4922 100644
+--- a/halo2_backend/Cargo.toml
++++ b/halo2_backend/Cargo.toml
+@@ -38,6 +38,8 @@ serde = { version = "1", optional = true, features = ["derive"] }
+ serde_derive = { version = "1", optional = true}
+ rayon = "1.8"
+ halo2_middleware = { path = "../halo2_middleware" }
++# Out-of-core SRS + quotient streaming. Leaf crate, halo2curves-only, no cycle.
++halo2-stream = { path = "../../snark-stream/halo2-stream" }
+ 
+ [dev-dependencies]
+ assert_matches = "1.5"
+diff --git a/halo2_backend/src/plonk.rs b/halo2_backend/src/plonk.rs
+index b98da02..4d238f2 100644
+--- a/halo2_backend/src/plonk.rs
++++ b/halo2_backend/src/plonk.rs
+@@ -36,6 +36,9 @@ pub mod verifier;
+ 
+ pub use error::*;
+ 
++/// snark-stream: isolated out-of-core quotient benchmark (see [`evaluation::ss_bench_quotient`]).
++pub use evaluation::ss_bench_quotient;
++
+ /// This is a verifying key which allows for the verification of proofs for a
+ /// particular circuit.
+ #[derive(Clone, Debug)]
+diff --git a/halo2_backend/src/plonk/evaluation.rs b/halo2_backend/src/plonk/evaluation.rs
+index 9e6dc0b..d894888 100644
+--- a/halo2_backend/src/plonk/evaluation.rs
++++ b/halo2_backend/src/plonk/evaluation.rs
+@@ -23,6 +23,80 @@ fn get_rotation_idx(idx: usize, rot: i32, rot_scale: i32, isize: i32) -> usize {
+     (((idx as i32) + (rot * rot_scale)).rem_euclid(isize)) as usize
+ }
+ 
++/// Current resident set (VmRSS) in MB — for the snark-stream `SS_RSS_TRACE`
++/// instrument that isolates the quotient phase's footprint.
++fn ss_rss_mb() -> u64 {
++    std::fs::read_to_string("/proc/self/status")
++        .ok()
++        .and_then(|s| {
++            s.lines()
++                .find(|l| l.starts_with("VmRSS:"))
++                .and_then(|l| l.split_whitespace().nth(1))
++                .and_then(|kb| kb.parse::<u64>().ok())
++        })
++        .map_or(0, |kb| kb / 1024)
++}
++
++/// A `2^extended_k` extended coset spilled to a scratch file as canonical
++/// `PrimeField::to_repr` records, from which only a tile-sized window is ever read
++/// back (the snark-stream `evaluate_h_ooc_disk` path). Field-generic, so it works
++/// at the generic prover call site without a `SerdeObject` bound; the resident set
++/// is the window, not the domain.
++struct ReprCoset {
++    f: std::fs::File,
++    size: usize,
++    width: usize,
++}
++
++impl ReprCoset {
++    fn create<F: PrimeField>(path: &std::path::Path, vals: &[F]) -> std::io::Result<Self> {
++        use std::io::Write;
++        let width = F::Repr::default().as_ref().len();
++        let mut buf = vec![0u8; vals.len() * width];
++        for (v, c) in vals.iter().zip(buf.chunks_exact_mut(width)) {
++            c.copy_from_slice(v.to_repr().as_ref());
++        }
++        let mut f = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(path)?;
++        f.write_all(&buf)?;
++        Ok(Self {
++            f,
++            size: vals.len(),
++            width,
++        })
++    }
++
++    /// The window `[start - halo, start - halo + wl)` (mod `size`), wrapping at the
++    /// boundary — exactly the range the in-RAM `win` closure builds.
++    fn window<F: PrimeField>(&self, start: usize, halo: usize, wl: usize) -> std::io::Result<Vec<F>> {
++        use std::os::unix::fs::FileExt;
++        let mut out = Vec::with_capacity(wl);
++        let mut cur = (start as i64 - halo as i64).rem_euclid(self.size as i64) as usize;
++        let mut remaining = wl;
++        let mut buf = Vec::new();
++        while remaining > 0 {
++            let run = remaining.min(self.size - cur);
++            buf.resize(run * self.width, 0);
++            self.f.read_exact_at(&mut buf, (cur * self.width) as u64)?;
++            for c in buf.chunks_exact(self.width) {
++                let mut repr = F::Repr::default();
++                repr.as_mut().copy_from_slice(c);
++                out.push(Option::<F>::from(F::from_repr(repr)).expect("canonical repr"));
++            }
++            remaining -= run;
++            cur += run;
++            if cur == self.size {
++                cur = 0;
++            }
++        }
++        Ok(out)
++    }
++}
++
+ /// Value used in [`Calculation`]
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+ enum ValueSource {
+@@ -312,6 +386,781 @@ impl<C: CurveAffine> Evaluator<C> {
+         ev
+     }
+ 
++    /// Out-of-core / tiled twin of [`Self::evaluate_h`]. Evaluates the quotient
++    /// over the extended domain in tiles, feeding the **unchanged** gate evaluator
++    /// a *window* of each coset plus a tile-local index — with `isize` set to the
++    /// window length, so `get_rotation_idx`'s `rem_euclid` is a no-op inside the
++    /// window. Covers every quotient term (custom gates, permutation, lookup,
++    /// shuffle). Produces byte-for-byte the same polynomial as `evaluate_h`; the
++    /// point is that the cosets need only be resident a tile (+ a small rotation
++    /// halo) at a time, never the full domain.
++    #[allow(clippy::too_many_arguments)]
++    pub(in crate::plonk) fn evaluate_h_ooc(
++        &self,
++        pk: &ProvingKey<C>,
++        advice_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
++        instance_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
++        challenges: &[C::ScalarExt],
++        y: C::ScalarExt,
++        beta: C::ScalarExt,
++        gamma: C::ScalarExt,
++        theta: C::ScalarExt,
++        lookups: &[Vec<lookup::prover::Committed<C>>],
++        shuffles: &[Vec<shuffle::prover::Committed<C>>],
++        permutations: &[permutation::prover::Committed<C>],
++        tile: usize,
++    ) -> Polynomial<C::ScalarExt, ExtendedLagrangeCoeff> {
++        let domain = &pk.vk.domain;
++        let size = domain.extended_len();
++        let rot_scale = 1i32 << (domain.extended_k() - domain.k());
++        let extended_omega = domain.get_extended_omega();
++        let one = C::ScalarExt::ONE;
++        let fixed = &pk.fixed_cosets[..];
++        let (l0, l_last, l_active_row) = (&pk.l0, &pk.l_last, &pk.l_active_row);
++        let p = &pk.vk.cs.permutation;
++
++        // Halo must cover every rotation any term queries: the gates' own, the
++        // permutation's +1 (z(omega X)) and -(blinding+1) (z at last row), and the
++        // shuffle's +1 plus whatever its input/shuffle expression evaluators query.
++        let has_perm = permutations.iter().any(|perm| !perm.sets.is_empty());
++        let has_shuffle = shuffles.iter().any(|s| !s.is_empty());
++        let has_lookup = lookups.iter().any(|l| !l.is_empty());
++        let blinding_factors = pk.vk.cs.blinding_factors();
++        let perm_rot = if has_perm { (blinding_factors + 1).max(1) } else { 0 };
++        let shuffle_rot = if has_shuffle {
++            self.shuffles
++                .iter()
++                .flat_map(|e| e.rotations.iter())
++                .map(|r| r.unsigned_abs() as usize)
++                .max()
++                .unwrap_or(0)
++                .max(1)
++        } else {
++            0
++        };
++        // The lookup queries product/permuted_input at +1 and -1, plus whatever its
++        // input/table expression evaluator queries.
++        let lookup_rot = if has_lookup {
++            self.lookups
++                .iter()
++                .flat_map(|e| e.rotations.iter())
++                .map(|r| r.unsigned_abs() as usize)
++                .max()
++                .unwrap_or(0)
++                .max(1)
++        } else {
++            0
++        };
++        let max_rot = self
++            .custom_gates
++            .rotations
++            .iter()
++            .map(|r| r.unsigned_abs() as usize)
++            .max()
++            .unwrap_or(0)
++            .max(perm_rot)
++            .max(shuffle_rot)
++            .max(lookup_rot);
++        let halo = max_rot * rot_scale as usize;
++
++        let advice: Vec<Vec<Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>>> = advice_polys
++            .iter()
++            .map(|aps| aps.iter().map(|p| domain.coeff_to_extended(p.clone())).collect())
++            .collect();
++        let instance: Vec<Vec<Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>>> = instance_polys
++            .iter()
++            .map(|ips| ips.iter().map(|p| domain.coeff_to_extended(p.clone())).collect())
++            .collect();
++
++        // Window `[s - halo, s + wl - halo)` (mod size) of one coset.
++        let win = |coset: &Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>, s: usize, wl: usize| {
++            let lo = s as i64 - halo as i64;
++            let values: Vec<C::ScalarExt> = (0..wl)
++                .map(|j| coset[(lo + j as i64).rem_euclid(size as i64) as usize])
++                .collect();
++            Polynomial::<C::ScalarExt, ExtendedLagrangeCoeff> {
++                values,
++                _marker: std::marker::PhantomData,
++            }
++        };
++
++        let mut values = domain.empty_extended();
++        for ((((advice, instance), permutation), shuffles_inst), lookups_inst) in advice
++            .iter()
++            .zip(instance.iter())
++            .zip(permutations.iter())
++            .zip(shuffles.iter())
++            .zip(lookups.iter())
++        {
++            // Shuffle grand-product cosets for this instance (extended form).
++            let shuffle_pc: Vec<Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>> = shuffles_inst
++                .iter()
++                .map(|sh| domain.coeff_to_extended(sh.product_poly.clone()))
++                .collect();
++            // Lookup product / permuted-input / permuted-table cosets for this
++            // instance (extended form).
++            #[allow(clippy::type_complexity)]
++            let lookup_cosets: Vec<(
++                Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>,
++                Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>,
++                Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>,
++            )> = lookups_inst
++                .iter()
++                .map(|lk| {
++                    (
++                        domain.coeff_to_extended(lk.product_poly.clone()),
++                        domain.coeff_to_extended(lk.permuted_input_poly.clone()),
++                        domain.coeff_to_extended(lk.permuted_table_poly.clone()),
++                    )
++                })
++                .collect();
++            // Permutation grand-product cosets for this instance (extended form).
++            let sets = &permutation.sets;
++            let ppc: Vec<Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>> = sets
++                .iter()
++                .map(|set| domain.coeff_to_extended(set.permutation_product_poly.clone()))
++                .collect();
++            let chunk_len = pk.vk.cs.degree() - 2;
++            let last_rotation = Rotation(-((blinding_factors + 1) as i32));
++            let delta_start = beta * C::Scalar::ZETA;
++
++            let mut s = 0;
++            while s < size {
++                let len = tile.min(size - s);
++                let wl = len + 2 * halo;
++                let fixed_w: Vec<_> = fixed.iter().map(|c| win(c, s, wl)).collect();
++                let advice_w: Vec<_> = advice.iter().map(|c| win(c, s, wl)).collect();
++                let instance_w: Vec<_> = instance.iter().map(|c| win(c, s, wl)).collect();
++
++                // Custom gates (gate evaluator reused unchanged on the windows).
++                let mut eval_data = self.custom_gates.instance();
++                for i in 0..len {
++                    let prev = values[s + i];
++                    values[s + i] = self.custom_gates.evaluate(
++                        &mut eval_data,
++                        &fixed_w,
++                        &advice_w,
++                        &instance_w,
++                        challenges,
++                        &beta,
++                        &gamma,
++                        &theta,
++                        &y,
++                        &prev,
++                        halo + i,
++                        rot_scale,
++                        wl as i32,
++                    );
++                }
++
++                // Permutation argument, folded into the same tile values.
++                if !sets.is_empty() {
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let ppc_w: Vec<_> = ppc.iter().map(|c| win(c, s, wl)).collect();
++                    let perm_cosets_w: Vec<_> =
++                        pk.permutation.cosets.iter().map(|c| win(c, s, wl)).collect();
++                    let first = ppc_w.first().unwrap();
++                    let last = ppc_w.last().unwrap();
++
++                    // beta_term tracks the ABSOLUTE position omega^(s+i), not the
++                    // window-local index.
++                    let mut beta_term = extended_omega.pow_vartime([s as u64, 0, 0, 0]);
++                    for i in 0..len {
++                        let idx = halo + i; // window-local
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let r_last = get_rotation_idx(idx, last_rotation.0, rot_scale, wl as i32);
++                        let mut value = values[s + i];
++
++                        value = value * y + ((one - first[idx]) * l0_w[idx]);
++                        value = value * y
++                            + ((last[idx] * last[idx] - last[idx]) * l_last_w[idx]);
++                        for set_idx in 1..sets.len() {
++                            value = value * y
++                                + ((ppc_w[set_idx][idx] - ppc_w[set_idx - 1][r_last]) * l0_w[idx]);
++                        }
++                        let mut current_delta = delta_start * beta_term;
++                        for ((ppc_set, columns), coset_chunk) in ppc_w
++                            .iter()
++                            .zip(p.columns.chunks(chunk_len))
++                            .zip(perm_cosets_w.chunks(chunk_len))
++                        {
++                            let mut left = ppc_set[r_next];
++                            for (column, perm) in columns.iter().zip(coset_chunk.iter()) {
++                                let col_vals = match column.column_type {
++                                    Any::Advice => &advice_w[column.index],
++                                    Any::Fixed => &fixed_w[column.index],
++                                    Any::Instance => &instance_w[column.index],
++                                };
++                                left *= col_vals[idx] + beta * perm[idx] + gamma;
++                            }
++                            let mut right = ppc_set[idx];
++                            for &column in columns.iter() {
++                                let col_vals = match column.column_type {
++                                    Any::Advice => &advice_w[column.index],
++                                    Any::Fixed => &fixed_w[column.index],
++                                    Any::Instance => &instance_w[column.index],
++                                };
++                                right *= col_vals[idx] + current_delta + gamma;
++                                current_delta *= &C::Scalar::DELTA;
++                            }
++                            value = value * y + ((left - right) * l_active_w[idx]);
++                        }
++                        beta_term *= &extended_omega;
++                        values[s + i] = value;
++                    }
++                }
++
++                // Lookup argument, folded into the same tile values (before the
++                // shuffle, matching evaluate_h's term order so the y-fold agrees).
++                // The table-expression evaluator is reused on the windows; the
++                // product / permuted cosets are read at idx, +1 and -1.
++                for n in 0..lookups_inst.len() {
++                    let (product_coset, permuted_input_coset, permuted_table_coset) =
++                        &lookup_cosets[n];
++                    let prod_w = win(product_coset, s, wl);
++                    let pin_w = win(permuted_input_coset, s, wl);
++                    let ptab_w = win(permuted_table_coset, s, wl);
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let lookup_eval = &self.lookups[n];
++                    let mut ed = lookup_eval.instance();
++                    for i in 0..len {
++                        let idx = halo + i;
++                        let table_value = lookup_eval.evaluate(
++                            &mut ed,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let r_prev = get_rotation_idx(idx, -1, rot_scale, wl as i32);
++                        let a_minus_s = pin_w[idx] - ptab_w[idx];
++                        let mut value = values[s + i];
++                        // l_0(X) * (1 - z(X)) = 0
++                        value = value * y + ((one - prod_w[idx]) * l0_w[idx]);
++                        // l_last(X) * (z(X)^2 - z(X)) = 0
++                        value = value * y
++                            + ((prod_w[idx] * prod_w[idx] - prod_w[idx]) * l_last_w[idx]);
++                        // (1 - (l_last + l_blind)) * (
++                        //   z(wX)(a'+beta)(s'+gamma) - z(X)(input)(table)
++                        // ) = 0
++                        value = value * y
++                            + ((prod_w[r_next]
++                                * (pin_w[idx] + beta)
++                                * (ptab_w[idx] + gamma)
++                                - prod_w[idx] * table_value)
++                                * l_active_w[idx]);
++                        // l_0(X) * (a'(X) - s'(X)) = 0
++                        value = value * y + (a_minus_s * l0_w[idx]);
++                        // (1 - (l_last + l_blind)) * (a'-s')*(a'(X) - a'(w^{-1} X)) = 0
++                        value = value * y
++                            + (a_minus_s * (pin_w[idx] - pin_w[r_prev]) * l_active_w[idx]);
++                        values[s + i] = value;
++                    }
++                }
++
++                // Shuffle argument, folded into the same tile values. Its input /
++                // shuffle expression evaluators are reused on the windows exactly
++                // like the custom gates.
++                for n in 0..shuffles_inst.len() {
++                    let prod_w = win(&shuffle_pc[n], s, wl);
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let input_eval = &self.shuffles[2 * n];
++                    let shuffle_eval = &self.shuffles[2 * n + 1];
++                    let mut ed_in = input_eval.instance();
++                    let mut ed_sh = shuffle_eval.instance();
++                    for i in 0..len {
++                        let idx = halo + i;
++                        let input_value = input_eval.evaluate(
++                            &mut ed_in,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let shuffle_value = shuffle_eval.evaluate(
++                            &mut ed_sh,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let mut value = values[s + i];
++                        value = value * y + ((one - prod_w[idx]) * l0_w[idx]);
++                        value = value * y
++                            + ((prod_w[idx] * prod_w[idx] - prod_w[idx]) * l_last_w[idx]);
++                        value = value * y
++                            + l_active_w[idx]
++                                * (prod_w[r_next] * shuffle_value - prod_w[idx] * input_value);
++                        values[s + i] = value;
++                    }
++                }
++                s += len;
++            }
++        }
++        values
++    }
++
++    /// Disk-backed twin of [`Self::evaluate_h_ooc`]: the same tiled, windowed
++    /// evaluation, but the *fresh* extended cosets the quotient builds — the advice,
++    /// instance, permutation-product, shuffle-product and lookup cosets — are spilled
++    /// to scratch files one at a time and read back a window per tile, and the output
++    /// `values` accumulator is streamed to disk a tile at a time. So in-core
++    /// `evaluate_h` holds every fresh coset *plus* the whole accumulator resident at
++    /// once (≈ `n_cosets · 2^extended_k`), whereas this holds at most one coset during
++    /// the spill phase and `O(tile)` during the evaluation. The proving-key cosets
++    /// (`fixed_cosets`, `l0/l_last/l_active`, `permutation.cosets`) are read from the
++    /// already-resident `pk` — they are the shared baseline, not a fresh allocation.
++    /// Byte-for-byte identical to `evaluate_h`; scratch lives under `dir`.
++    #[allow(clippy::too_many_arguments)]
++    pub(in crate::plonk) fn evaluate_h_ooc_disk(
++        &self,
++        pk: &ProvingKey<C>,
++        advice_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
++        instance_polys: &[&[Polynomial<C::ScalarExt, Coeff>]],
++        challenges: &[C::ScalarExt],
++        y: C::ScalarExt,
++        beta: C::ScalarExt,
++        gamma: C::ScalarExt,
++        theta: C::ScalarExt,
++        lookups: &[Vec<lookup::prover::Committed<C>>],
++        shuffles: &[Vec<shuffle::prover::Committed<C>>],
++        permutations: &[permutation::prover::Committed<C>],
++        tile: usize,
++        dir: &std::path::Path,
++    ) -> std::io::Result<Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>> {
++        use std::os::unix::fs::FileExt;
++
++        let domain = &pk.vk.domain;
++        let size = domain.extended_len();
++        let rot_scale = 1i32 << (domain.extended_k() - domain.k());
++        let extended_omega = domain.get_extended_omega();
++        let one = C::ScalarExt::ONE;
++        let fixed = &pk.fixed_cosets[..];
++        let (l0, l_last, l_active_row) = (&pk.l0, &pk.l_last, &pk.l_active_row);
++        let p = &pk.vk.cs.permutation;
++
++        let has_perm = permutations.iter().any(|perm| !perm.sets.is_empty());
++        let has_shuffle = shuffles.iter().any(|s| !s.is_empty());
++        let has_lookup = lookups.iter().any(|l| !l.is_empty());
++        let blinding_factors = pk.vk.cs.blinding_factors();
++        let perm_rot = if has_perm { (blinding_factors + 1).max(1) } else { 0 };
++        let shuffle_rot = if has_shuffle {
++            self.shuffles
++                .iter()
++                .flat_map(|e| e.rotations.iter())
++                .map(|r| r.unsigned_abs() as usize)
++                .max()
++                .unwrap_or(0)
++                .max(1)
++        } else {
++            0
++        };
++        let lookup_rot = if has_lookup {
++            self.lookups
++                .iter()
++                .flat_map(|e| e.rotations.iter())
++                .map(|r| r.unsigned_abs() as usize)
++                .max()
++                .unwrap_or(0)
++                .max(1)
++        } else {
++            0
++        };
++        let max_rot = self
++            .custom_gates
++            .rotations
++            .iter()
++            .map(|r| r.unsigned_abs() as usize)
++            .max()
++            .unwrap_or(0)
++            .max(perm_rot)
++            .max(shuffle_rot)
++            .max(lookup_rot);
++        let halo = max_rot * rot_scale as usize;
++
++        // Spill every advice / instance coset to disk one at a time (peak = one
++        // coset), instead of materialising them all in RAM.
++        let spill = |tag: &str, ii: usize, j: usize, poly: &Polynomial<C::ScalarExt, Coeff>| {
++            let path = dir.join(format!("ss_h_{tag}_{ii}_{j}.bin"));
++            let ext = domain.coeff_to_extended(poly.clone());
++            ReprCoset::create(&path, &ext.values)
++        };
++        let advice_d: Vec<Vec<ReprCoset>> = advice_polys
++            .iter()
++            .enumerate()
++            .map(|(ii, aps)| {
++                aps.iter()
++                    .enumerate()
++                    .map(|(j, p)| spill("adv", ii, j, p))
++                    .collect::<std::io::Result<_>>()
++            })
++            .collect::<std::io::Result<_>>()?;
++        let instance_d: Vec<Vec<ReprCoset>> = instance_polys
++            .iter()
++            .enumerate()
++            .map(|(ii, ips)| {
++                ips.iter()
++                    .enumerate()
++                    .map(|(j, p)| spill("ins", ii, j, p))
++                    .collect::<std::io::Result<_>>()
++            })
++            .collect::<std::io::Result<_>>()?;
++
++        // Window of a resident (proving-key) coset.
++        let win = |coset: &Polynomial<C::ScalarExt, ExtendedLagrangeCoeff>, s: usize, wl: usize| {
++            let lo = s as i64 - halo as i64;
++            let values: Vec<C::ScalarExt> = (0..wl)
++                .map(|j| coset[(lo + j as i64).rem_euclid(size as i64) as usize])
++                .collect();
++            Polynomial::<C::ScalarExt, ExtendedLagrangeCoeff> {
++                values,
++                _marker: std::marker::PhantomData,
++            }
++        };
++        // Window of a spilled coset (read from disk), as a Polynomial.
++        let dwin = |rc: &ReprCoset, s: usize, wl: usize| -> std::io::Result<_> {
++            Ok(Polynomial::<C::ScalarExt, ExtendedLagrangeCoeff> {
++                values: rc.window(s, halo, wl)?,
++                _marker: std::marker::PhantomData,
++            })
++        };
++
++        // The output accumulator, streamed to disk a tile at a time.
++        let width = <C::ScalarExt as PrimeField>::Repr::default().as_ref().len();
++        let out_path = dir.join("ss_h_values.bin");
++        let out_f = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&out_path)?;
++        out_f.set_len((size * width) as u64)?;
++
++        let trace = std::env::var("SS_RSS_TRACE").is_ok();
++        if trace {
++            eprintln!(
++                "SS_RSS  disk evaluate_h_ooc_disk: all fresh cosets spilled to disk, VmRSS={} MB",
++                ss_rss_mb()
++            );
++        }
++
++        for (ii, ((((advice_d, instance_d), permutation), shuffles_inst), lookups_inst)) in advice_d
++            .iter()
++            .zip(instance_d.iter())
++            .zip(permutations.iter())
++            .zip(shuffles.iter())
++            .zip(lookups.iter())
++            .enumerate()
++        {
++            // Spill the per-instance product / permuted cosets (one at a time).
++            let shuffle_d: Vec<ReprCoset> = shuffles_inst
++                .iter()
++                .enumerate()
++                .map(|(n, sh)| {
++                    let path = dir.join(format!("ss_h_shp_{ii}_{n}.bin"));
++                    ReprCoset::create(&path, &domain.coeff_to_extended(sh.product_poly.clone()).values)
++                })
++                .collect::<std::io::Result<_>>()?;
++            #[allow(clippy::type_complexity)]
++            let lookup_d: Vec<(ReprCoset, ReprCoset, ReprCoset)> = lookups_inst
++                .iter()
++                .enumerate()
++                .map(|(n, lk)| {
++                    let pr = dir.join(format!("ss_h_lkp_{ii}_{n}.bin"));
++                    let pin = dir.join(format!("ss_h_lki_{ii}_{n}.bin"));
++                    let pta = dir.join(format!("ss_h_lkt_{ii}_{n}.bin"));
++                    Ok((
++                        ReprCoset::create(&pr, &domain.coeff_to_extended(lk.product_poly.clone()).values)?,
++                        ReprCoset::create(&pin, &domain.coeff_to_extended(lk.permuted_input_poly.clone()).values)?,
++                        ReprCoset::create(&pta, &domain.coeff_to_extended(lk.permuted_table_poly.clone()).values)?,
++                    ))
++                })
++                .collect::<std::io::Result<_>>()?;
++            let sets = &permutation.sets;
++            let ppc_d: Vec<ReprCoset> = sets
++                .iter()
++                .enumerate()
++                .map(|(n, set)| {
++                    let path = dir.join(format!("ss_h_ppc_{ii}_{n}.bin"));
++                    ReprCoset::create(
++                        &path,
++                        &domain.coeff_to_extended(set.permutation_product_poly.clone()).values,
++                    )
++                })
++                .collect::<std::io::Result<_>>()?;
++            let chunk_len = pk.vk.cs.degree() - 2;
++            let last_rotation = Rotation(-((blinding_factors + 1) as i32));
++            let delta_start = beta * C::Scalar::ZETA;
++
++            let mut s = 0;
++            while s < size {
++                let len = tile.min(size - s);
++                let wl = len + 2 * halo;
++                // Tile-local accumulator (never the whole domain).
++                let mut tv = vec![C::ScalarExt::ZERO; len];
++
++                let fixed_w: Vec<_> = fixed.iter().map(|c| win(c, s, wl)).collect();
++                let advice_w: Vec<_> =
++                    advice_d.iter().map(|c| dwin(c, s, wl)).collect::<std::io::Result<_>>()?;
++                let instance_w: Vec<_> =
++                    instance_d.iter().map(|c| dwin(c, s, wl)).collect::<std::io::Result<_>>()?;
++
++                // Custom gates.
++                let mut eval_data = self.custom_gates.instance();
++                for i in 0..len {
++                    let prev = tv[i];
++                    tv[i] = self.custom_gates.evaluate(
++                        &mut eval_data,
++                        &fixed_w,
++                        &advice_w,
++                        &instance_w,
++                        challenges,
++                        &beta,
++                        &gamma,
++                        &theta,
++                        &y,
++                        &prev,
++                        halo + i,
++                        rot_scale,
++                        wl as i32,
++                    );
++                }
++
++                // Permutation.
++                if !sets.is_empty() {
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let ppc_w: Vec<_> =
++                        ppc_d.iter().map(|c| dwin(c, s, wl)).collect::<std::io::Result<_>>()?;
++                    let perm_cosets_w: Vec<_> =
++                        pk.permutation.cosets.iter().map(|c| win(c, s, wl)).collect();
++                    let first = ppc_w.first().unwrap();
++                    let last = ppc_w.last().unwrap();
++
++                    let mut beta_term = extended_omega.pow_vartime([s as u64, 0, 0, 0]);
++                    for i in 0..len {
++                        let idx = halo + i;
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let r_last = get_rotation_idx(idx, last_rotation.0, rot_scale, wl as i32);
++                        let mut value = tv[i];
++
++                        value = value * y + ((one - first[idx]) * l0_w[idx]);
++                        value = value * y + ((last[idx] * last[idx] - last[idx]) * l_last_w[idx]);
++                        for set_idx in 1..sets.len() {
++                            value = value * y
++                                + ((ppc_w[set_idx][idx] - ppc_w[set_idx - 1][r_last]) * l0_w[idx]);
++                        }
++                        let mut current_delta = delta_start * beta_term;
++                        for ((ppc_set, columns), coset_chunk) in ppc_w
++                            .iter()
++                            .zip(p.columns.chunks(chunk_len))
++                            .zip(perm_cosets_w.chunks(chunk_len))
++                        {
++                            let mut left = ppc_set[r_next];
++                            for (column, perm) in columns.iter().zip(coset_chunk.iter()) {
++                                let col_vals = match column.column_type {
++                                    Any::Advice => &advice_w[column.index],
++                                    Any::Fixed => &fixed_w[column.index],
++                                    Any::Instance => &instance_w[column.index],
++                                };
++                                left *= col_vals[idx] + beta * perm[idx] + gamma;
++                            }
++                            let mut right = ppc_set[idx];
++                            for &column in columns.iter() {
++                                let col_vals = match column.column_type {
++                                    Any::Advice => &advice_w[column.index],
++                                    Any::Fixed => &fixed_w[column.index],
++                                    Any::Instance => &instance_w[column.index],
++                                };
++                                right *= col_vals[idx] + current_delta + gamma;
++                                current_delta *= &C::Scalar::DELTA;
++                            }
++                            value = value * y + ((left - right) * l_active_w[idx]);
++                        }
++                        beta_term *= &extended_omega;
++                        tv[i] = value;
++                    }
++                }
++
++                // Lookup (before shuffle, matching evaluate_h's term order).
++                for n in 0..lookups_inst.len() {
++                    let (product_d, pin_d, ptab_d) = &lookup_d[n];
++                    let prod_w = dwin(product_d, s, wl)?;
++                    let pin_w = dwin(pin_d, s, wl)?;
++                    let ptab_w = dwin(ptab_d, s, wl)?;
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let lookup_eval = &self.lookups[n];
++                    let mut ed = lookup_eval.instance();
++                    for i in 0..len {
++                        let idx = halo + i;
++                        let table_value = lookup_eval.evaluate(
++                            &mut ed,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let r_prev = get_rotation_idx(idx, -1, rot_scale, wl as i32);
++                        let a_minus_s = pin_w[idx] - ptab_w[idx];
++                        let mut value = tv[i];
++                        value = value * y + ((one - prod_w[idx]) * l0_w[idx]);
++                        value = value * y
++                            + ((prod_w[idx] * prod_w[idx] - prod_w[idx]) * l_last_w[idx]);
++                        value = value * y
++                            + ((prod_w[r_next] * (pin_w[idx] + beta) * (ptab_w[idx] + gamma)
++                                - prod_w[idx] * table_value)
++                                * l_active_w[idx]);
++                        value = value * y + (a_minus_s * l0_w[idx]);
++                        value = value * y
++                            + (a_minus_s * (pin_w[idx] - pin_w[r_prev]) * l_active_w[idx]);
++                        tv[i] = value;
++                    }
++                }
++
++                // Shuffle.
++                for n in 0..shuffles_inst.len() {
++                    let prod_w = dwin(&shuffle_d[n], s, wl)?;
++                    let l0_w = win(l0, s, wl);
++                    let l_last_w = win(l_last, s, wl);
++                    let l_active_w = win(l_active_row, s, wl);
++                    let input_eval = &self.shuffles[2 * n];
++                    let shuffle_eval = &self.shuffles[2 * n + 1];
++                    let mut ed_in = input_eval.instance();
++                    let mut ed_sh = shuffle_eval.instance();
++                    for i in 0..len {
++                        let idx = halo + i;
++                        let input_value = input_eval.evaluate(
++                            &mut ed_in,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let shuffle_value = shuffle_eval.evaluate(
++                            &mut ed_sh,
++                            &fixed_w,
++                            &advice_w,
++                            &instance_w,
++                            challenges,
++                            &beta,
++                            &gamma,
++                            &theta,
++                            &y,
++                            &C::ScalarExt::ZERO,
++                            idx,
++                            rot_scale,
++                            wl as i32,
++                        );
++                        let r_next = get_rotation_idx(idx, 1, rot_scale, wl as i32);
++                        let mut value = tv[i];
++                        value = value * y + ((one - prod_w[idx]) * l0_w[idx]);
++                        value = value * y
++                            + ((prod_w[idx] * prod_w[idx] - prod_w[idx]) * l_last_w[idx]);
++                        value = value * y
++                            + l_active_w[idx]
++                                * (prod_w[r_next] * shuffle_value - prod_w[idx] * input_value);
++                        tv[i] = value;
++                    }
++                }
++
++                // Stream this tile's results to the values file.
++                let mut buf = vec![0u8; len * width];
++                for (v, c) in tv.iter().zip(buf.chunks_exact_mut(width)) {
++                    c.copy_from_slice(v.to_repr().as_ref());
++                }
++                out_f.write_all_at(&buf, (s * width) as u64)?;
++                if trace && s == 0 {
++                    eprintln!(
++                        "SS_RSS  disk evaluate_h_ooc_disk: mid tile loop (window+tile-accum only), VmRSS={} MB",
++                        ss_rss_mb()
++                    );
++                }
++                s += len;
++            }
++        }
++
++        // Read the streamed accumulator back (only here is it domain-sized) and
++        // remove the scratch files.
++        let mut all = vec![0u8; size * width];
++        out_f.read_exact_at(&mut all, 0)?;
++        let values: Vec<C::ScalarExt> = all
++            .chunks_exact(width)
++            .map(|c| {
++                let mut repr = <C::ScalarExt as PrimeField>::Repr::default();
++                repr.as_mut().copy_from_slice(c);
++                Option::<C::ScalarExt>::from(C::ScalarExt::from_repr(repr)).expect("canonical repr")
++            })
++            .collect();
++        let _ = std::fs::remove_file(&out_path);
++        for e in std::fs::read_dir(dir)? {
++            let path = e?.path();
++            if path
++                .file_name()
++                .and_then(|n| n.to_str())
++                .is_some_and(|n| n.starts_with("ss_h_") && n.ends_with(".bin"))
++            {
++                let _ = std::fs::remove_file(path);
++            }
++        }
++
++        Ok(Polynomial {
++            values,
++            _marker: std::marker::PhantomData,
++        })
++    }
++
+     /// Evaluate h poly
+     #[allow(clippy::too_many_arguments)]
+     pub(in crate::plonk) fn evaluate_h(
+@@ -362,6 +1211,13 @@ impl<C: CurveAffine> Evaluator<C> {
+ 
+         let mut values = domain.empty_extended();
+ 
++        if std::env::var("SS_RSS_TRACE").is_ok() {
++            eprintln!(
++                "SS_RSS  in-core evaluate_h: all advice+instance cosets + values resident, VmRSS={} MB",
++                ss_rss_mb()
++            );
++        }
++
+         // Core expression evaluations
+         let num_threads = multicore::current_num_threads();
+         for ((((advice, instance), lookups), shuffles), permutation) in advice
+@@ -631,6 +1487,76 @@ impl<C: CurveAffine> Evaluator<C> {
+     }
+ }
+ 
++/// snark-stream isolated quotient benchmark. Evaluates the quotient for `pk` over
++/// the supplied advice columns — a *memory* benchmark, so the advice need not form
++/// a valid proof — either in-core (`disk == false`) or disk-backed (`disk == true`),
++/// with no permutation / lookup / shuffle terms (custom-gates circuits only). This
++/// runs the quotient *in isolation*, without the rest of the prover's resident state,
++/// so its peak RSS reflects the quotient alone: in-core holds every advice extended
++/// coset at once, the disk path holds one at a time plus an `O(tile)` window. Returns
++/// an 8-byte fingerprint of `h` so the two modes can be checked equal.
++#[allow(clippy::too_many_arguments)]
++pub fn ss_bench_quotient<C: CurveAffine>(
++    pk: &ProvingKey<C>,
++    advice: &[Polynomial<C::ScalarExt, Coeff>],
++    challenges: &[C::ScalarExt],
++    y: C::ScalarExt,
++    beta: C::ScalarExt,
++    gamma: C::ScalarExt,
++    theta: C::ScalarExt,
++    disk: bool,
++    tile: usize,
++    dir: &std::path::Path,
++) -> Vec<u8> {
++    let advice_slices: Vec<&[Polynomial<C::ScalarExt, Coeff>]> = vec![advice];
++    let instance_slices: Vec<&[Polynomial<C::ScalarExt, Coeff>]> = vec![&[]];
++    let lookups: Vec<Vec<lookup::prover::Committed<C>>> = vec![vec![]];
++    let shuffles: Vec<Vec<shuffle::prover::Committed<C>>> = vec![vec![]];
++    let permutations: Vec<permutation::prover::Committed<C>> =
++        vec![permutation::prover::Committed { sets: vec![] }];
++
++    let h = if disk {
++        pk.ev
++            .evaluate_h_ooc_disk(
++                pk,
++                &advice_slices,
++                &instance_slices,
++                challenges,
++                y,
++                beta,
++                gamma,
++                theta,
++                &lookups,
++                &shuffles,
++                &permutations,
++                tile,
++                dir,
++            )
++            .expect("evaluate_h_ooc_disk")
++    } else {
++        pk.ev.evaluate_h(
++            pk,
++            &advice_slices,
++            &instance_slices,
++            challenges,
++            y,
++            beta,
++            gamma,
++            theta,
++            &lookups,
++            &shuffles,
++            &permutations,
++        )
++    };
++
++    // A mode-independent rolling fingerprint over all of h.
++    let mut acc = C::ScalarExt::ZERO;
++    for v in &h.values {
++        acc = acc * C::ScalarExt::DELTA + v;
++    }
++    acc.to_repr().as_ref()[..8].to_vec()
++}
++
+ impl<C: CurveAffine> Default for GraphEvaluator<C> {
+     fn default() -> Self {
+         Self {
+diff --git a/halo2_backend/src/plonk/prover.rs b/halo2_backend/src/plonk/prover.rs
+index 08538d8..a4145d3 100644
+--- a/halo2_backend/src/plonk/prover.rs
++++ b/halo2_backend/src/plonk/prover.rs
+@@ -531,26 +531,128 @@ impl<
+         // [TRANSCRIPT-13]
+         let y: ChallengeY<_> = self.transcript.squeeze_challenge_scalar();
+ 
+-        let h_poly = self.pk.ev.evaluate_h(
+-            self.pk,
+-            &advice
+-                .iter()
+-                .map(|a| a.advice_polys.as_slice())
+-                .collect::<Vec<_>>(),
+-            &self
+-                .instances
+-                .iter()
+-                .map(|i| i.instance_polys.as_slice())
+-                .collect::<Vec<_>>(),
+-            &challenges,
+-            *y,
+-            *beta,
+-            *gamma,
+-            *theta,
+-            &lookups_committed,
+-            &shuffles_committed,
+-            &permutations_committed,
+-        );
++        let advice_slices = advice
++            .iter()
++            .map(|a| a.advice_polys.as_slice())
++            .collect::<Vec<_>>();
++        let instance_slices = self
++            .instances
++            .iter()
++            .map(|i| i.instance_polys.as_slice())
++            .collect::<Vec<_>>();
++        // snark-stream aggregate-RAM measurement: with SS_OOC_REPLACE set, compute
++        // h *only* via the disk-backed path (the in-core evaluate_h is skipped
++        // entirely, so the prover's peak RSS reflects the out-of-core quotient). The
++        // result is byte-identical, so the proof still verifies.
++        let h_poly = if std::env::var("SS_OOC_REPLACE").is_ok() {
++            let tile: usize = std::env::var("SS_OOC_TILE")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(1 << 12);
++            let dir = std::env::var("SS_OOC_DIR").unwrap_or_else(|_| "/var/tmp".to_string());
++            self.pk
++                .ev
++                .evaluate_h_ooc_disk(
++                    self.pk,
++                    &advice_slices,
++                    &instance_slices,
++                    &challenges,
++                    *y,
++                    *beta,
++                    *gamma,
++                    *theta,
++                    &lookups_committed,
++                    &shuffles_committed,
++                    &permutations_committed,
++                    tile,
++                    std::path::Path::new(&dir),
++                )
++                .expect("evaluate_h_ooc_disk")
++        } else {
++            self.pk.ev.evaluate_h(
++                self.pk,
++                &advice_slices,
++                &instance_slices,
++                &challenges,
++                *y,
++                *beta,
++                *gamma,
++                *theta,
++                &lookups_committed,
++                &shuffles_committed,
++                &permutations_committed,
++            )
++        };
++
++        // snark-stream: recompute the quotient out-of-core (tiled, windowed
++        // cosets, gate evaluator reused unchanged) and assert it is byte-identical.
++        if std::env::var("SS_CHECK_OOC_H").is_ok() {
++            let tile: usize = std::env::var("SS_OOC_TILE")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(1 << 12);
++            let h_ooc = self.pk.ev.evaluate_h_ooc(
++                self.pk,
++                &advice_slices,
++                &instance_slices,
++                &challenges,
++                *y,
++                *beta,
++                *gamma,
++                *theta,
++                &lookups_committed,
++                &shuffles_committed,
++                &permutations_committed,
++                tile,
++            );
++            assert_eq!(
++                h_poly.values, h_ooc.values,
++                "SS_CHECK_OOC_H: evaluate_h_ooc != evaluate_h"
++            );
++            eprintln!(
++                "SS_CHECK_OOC_H: out-of-core quotient == in-core, {} extended values, tile={tile}",
++                h_poly.values.len()
++            );
++        }
++
++        // snark-stream aggregate-RAM: recompute the quotient with the fresh cosets
++        // spilled to disk and read back a window per tile, and the accumulator
++        // streamed to disk — never the whole extended domain resident at once — and
++        // assert it is byte-identical to the in-core one.
++        if std::env::var("SS_CHECK_OOC_DISK").is_ok() {
++            let tile: usize = std::env::var("SS_OOC_TILE")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(1 << 12);
++            let dir = std::env::var("SS_OOC_DIR").unwrap_or_else(|_| "/var/tmp".to_string());
++            let h_disk = self
++                .pk
++                .ev
++                .evaluate_h_ooc_disk(
++                    self.pk,
++                    &advice_slices,
++                    &instance_slices,
++                    &challenges,
++                    *y,
++                    *beta,
++                    *gamma,
++                    *theta,
++                    &lookups_committed,
++                    &shuffles_committed,
++                    &permutations_committed,
++                    tile,
++                    std::path::Path::new(&dir),
++                )
++                .expect("evaluate_h_ooc_disk");
++            assert_eq!(
++                h_poly.values, h_disk.values,
++                "SS_CHECK_OOC_DISK: evaluate_h_ooc_disk != evaluate_h"
++            );
++            eprintln!(
++                "SS_CHECK_OOC_DISK: disk-backed quotient == in-core, {} extended values, tile={tile}",
++                h_poly.values.len()
++            );
++        }
+ 
+         // 8. Construct the vanishing argument's h(X) commitments --------------------------------------
+         // [TRANSCRIPT-14]
+diff --git a/halo2_backend/src/poly/kzg/commitment.rs b/halo2_backend/src/poly/kzg/commitment.rs
+index 89286cf..263ca21 100644
+--- a/halo2_backend/src/poly/kzg/commitment.rs
++++ b/halo2_backend/src/poly/kzg/commitment.rs
+@@ -16,6 +16,20 @@ use std::io;
+ 
+ use super::msm::MSMKZG;
+ 
++/// Out-of-core SRS source: when set, `commit`/`commit_lagrange`
++/// stream the bases from these files instead of from the in-RAM `g`/`g_lagrange`
++/// vectors (which are emptied by [`ParamsKZG::enable_streaming`]). The files hold
++/// the same points in halo2curves raw layout, so the commitment is bit-identical.
++#[derive(Debug, Clone)]
++pub struct StreamingSrs {
++    /// Coefficient-basis powers (`g`).
++    pub g_path: std::path::PathBuf,
++    /// Lagrange-basis powers (`g_lagrange`).
++    pub g_lagrange_path: std::path::PathBuf,
++    /// Streaming chunk size (bases held resident per read).
++    pub block: usize,
++}
++
+ /// These are the public parameters for the polynomial commitment scheme.
+ #[derive(Debug, Clone)]
+ pub struct ParamsKZG<E: Engine> {
+@@ -25,6 +39,8 @@ pub struct ParamsKZG<E: Engine> {
+     pub(crate) g_lagrange: Vec<E::G1Affine>,
+     pub(crate) g2: E::G2Affine,
+     pub(crate) s_g2: E::G2Affine,
++    /// `Some` ⇒ stream the bases from disk; `None` ⇒ stock in-RAM bases.
++    pub(crate) streaming: Option<StreamingSrs>,
+ }
+ 
+ /// Parameters KZG-based proof verification:
+@@ -221,6 +237,7 @@ where
+             g_lagrange,
+             g2,
+             s_g2,
++            streaming: None,
+         }
+     }
+ 
+@@ -244,6 +261,7 @@ where
+             g,
+             g2,
+             s_g2,
++            streaming: None,
+         }
+     }
+ 
+@@ -366,10 +384,89 @@ where
+             g_lagrange,
+             g2,
+             s_g2,
++            streaming: None,
+         })
+     }
+ }
+ 
++impl<E: Engine> ParamsKZG<E>
++where
++    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
++    E::G1: CurveExt<AffineExt = E::G1Affine>,
++{
++    /// Move the SRS out of RAM. Writes `g`/`g_lagrange` to the given files
++    /// (halo2curves raw layout), drops the in-RAM vectors, and switches
++    /// `commit`/`commit_lagrange` to stream the bases from disk. The committed
++    /// points are unchanged, so the proof is bit-identical and verifies against
++    /// stock verifier params. The SRS is written once here (transiently in RAM);
++    /// a prover process that *reads* these params from disk never holds the bases.
++    pub fn enable_streaming(
++        &mut self,
++        g_path: impl Into<std::path::PathBuf>,
++        g_lagrange_path: impl Into<std::path::PathBuf>,
++        block: usize,
++    ) -> std::io::Result<()> {
++        let g_path = g_path.into();
++        let g_lagrange_path = g_lagrange_path.into();
++        halo2_stream::msm::write_bases(&g_path, &self.g)?;
++        halo2_stream::msm::write_bases(&g_lagrange_path, &self.g_lagrange)?;
++        self.g = Vec::new();
++        self.g_lagrange = Vec::new();
++        self.streaming = Some(StreamingSrs {
++            g_path,
++            g_lagrange_path,
++            block,
++        });
++        Ok(())
++    }
++
++    /// Build stock (in-RAM) params from raw SRS vectors — the A side of the
++    /// out-of-core A/B measurement (the prover process reads the SRS into RAM).
++    pub fn from_raw_srs(
++        k: u32,
++        g: Vec<E::G1Affine>,
++        g_lagrange: Vec<E::G1Affine>,
++        g2: E::G2Affine,
++        s_g2: E::G2Affine,
++    ) -> Self {
++        Self {
++            k,
++            n: 1 << k,
++            g,
++            g_lagrange,
++            g2,
++            s_g2,
++            streaming: None,
++        }
++    }
++
++    /// Build streaming params that point at on-disk SRS files and hold no bases
++    /// in RAM — the B side. `commit`/`commit_lagrange` stream from the files; the
++    /// prover process never materializes the SRS.
++    pub fn streaming_params(
++        k: u32,
++        g2: E::G2Affine,
++        s_g2: E::G2Affine,
++        g_path: impl Into<std::path::PathBuf>,
++        g_lagrange_path: impl Into<std::path::PathBuf>,
++        block: usize,
++    ) -> Self {
++        Self {
++            k,
++            n: 1 << k,
++            g: Vec::new(),
++            g_lagrange: Vec::new(),
++            g2,
++            s_g2,
++            streaming: Some(StreamingSrs {
++                g_path: g_path.into(),
++                g_lagrange_path: g_lagrange_path.into(),
++                block,
++            }),
++        }
++    }
++}
++
+ impl<E: Engine> Params<E::G1Affine> for ParamsKZG<E>
+ where
+     E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+@@ -390,6 +487,16 @@ where
+         poly: &Polynomial<E::Fr, LagrangeCoeff>,
+         _: Blind<E::Fr>,
+     ) -> E::G1 {
++        // Stream the Lagrange-basis SRS from disk when enabled.
++        if let Some(s) = &self.streaming {
++            let scalars: Vec<E::Fr> = poly.iter().copied().collect();
++            return halo2_stream::msm::msm_ooc_bases::<E::G1Affine>(
++                &s.g_lagrange_path,
++                &scalars,
++                s.block,
++            )
++            .expect("streaming commit_lagrange");
++        }
+         let mut scalars = Vec::with_capacity(poly.len());
+         scalars.extend(poly.iter());
+         let bases = &self.g_lagrange;
+@@ -449,6 +556,12 @@ where
+         poly: &Polynomial<E::Fr, Coeff>,
+         _: Blind<E::Fr>,
+     ) -> E::G1 {
++        // Stream the coefficient-basis SRS from disk when enabled.
++        if let Some(s) = &self.streaming {
++            let scalars: Vec<E::Fr> = poly.iter().copied().collect();
++            return halo2_stream::msm::msm_ooc_bases::<E::G1Affine>(&s.g_path, &scalars, s.block)
++                .expect("streaming commit");
++        }
+         let mut scalars = Vec::with_capacity(poly.len());
+         scalars.extend(poly.iter());
+         let bases = &self.g;
